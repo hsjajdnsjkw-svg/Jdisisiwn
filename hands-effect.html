@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Между руками</title>
+<style>
+  :root { --violet:#7b2fff; --ink:#120b22; }
+  * { box-sizing:border-box; margin:0; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; background:var(--ink); color:#fff; font-family:system-ui,-apple-system,Roboto,sans-serif; overflow:hidden; }
+  video { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; object-fit:cover; background:#000; }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:18px; padding:24px; text-align:center; background:var(--ink); z-index:5; }
+  #start h1 { font-size:28px; line-height:1.15; }
+  #start p { max-width:300px; opacity:.75; font-size:15px; line-height:1.4; }
+  button { font:inherit; font-weight:600; color:#fff; background:var(--violet); border:0; border-radius:14px; padding:14px 26px; font-size:17px; }
+  #ui { position:fixed; left:0; right:0; bottom:0; padding:12px 16px calc(16px + env(safe-area-inset-bottom)); display:none; justify-content:center; align-items:center; gap:12px; z-index:4; }
+  #ui button { background:rgba(18,11,34,.7); backdrop-filter:blur(8px); font-size:15px; padding:11px 18px; }
+  #status { position:fixed; top:calc(10px + env(safe-area-inset-top)); left:0; right:0; text-align:center; font-size:14px; z-index:4; text-shadow:0 1px 4px #000; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>Покажите обе руки</h1>
+  <p>Между ладонями появится блок, который следует за руками: растёт, наклоняется и двигается вместе с ними.</p>
+  <button id="go">Включить камеру</button>
+  <p id="err" style="color:#ff9bb0"></p>
+</div>
+<div id="status"></div>
+<video id="v" playsinline muted autoplay></video>
+<canvas id="c"></canvas>
+<div id="ui">
+  <button id="mode">Эффект: блок</button>
+  <button id="flip">Сменить камеру</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const video = document.getElementById('v');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const errEl = document.getElementById('err');
+
+let facing = 'user';
+let mode = 0; // 0 блок, 1 мем-лицо
+const MODES = ['блок', 'мем'];
+let stream = null, hands = null, busy = false, results = null;
+
+// Сглаженное состояние эффекта
+const S = { x:0, y:0, w:0, h:0, a:0, alpha:0 };
+const lerp = (a, b, t) => a + (b - a) * t;
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 720 } }
+  });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+}
+
+function initHands() {
+  hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+  });
+  hands.onResults(r => { results = r; });
+}
+
+async function loop() {
+  if (video.readyState >= 2 && !busy) {
+    busy = true;
+    try { await hands.send({ image: video }); } catch (e) { console.error(e); }
+    busy = false;
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+
+function palm(lm) {
+  // центр ладони: среднее запястья и оснований пальцев
+  const ids = [0, 5, 9, 13, 17];
+  let x = 0, y = 0;
+  ids.forEach(i => { x += lm[i].x; y += lm[i].y; });
+  return { x: x / ids.length, y: y / ids.length };
+}
+
+function render() {
+  const W = canvas.width, H = canvas.height;
+  ctx.save();
+  // зеркалим картинку для фронтальной камеры
+  const mirror = facing === 'user';
+  if (mirror) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(video, 0, 0, W, H);
+  ctx.restore();
+
+  const list = results && results.multiHandLandmarks ? results.multiHandLandmarks : [];
+  const pts = list.map(palm).map(p => ({ x: (mirror ? 1 - p.x : p.x) * W, y: p.y * H }));
+
+  let target = null;
+  if (pts.length >= 2) {
+    pts.sort((a, b) => a.x - b.x);
+    const p1 = pts[0], p2 = pts[1];
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    const dist = Math.hypot(dx, dy);
+    target = {
+      x: (p1.x + p2.x) / 2,
+      y: (p1.y + p2.y) / 2,
+      w: Math.max(dist * 0.9, 40),
+      h: Math.max(dist * 0.55, 30),
+      a: Math.atan2(dy, dx)
+    };
+  }
+
+  if (target) {
+    if (S.alpha < 0.05) Object.assign(S, target); // появление без «пролёта» из старой позиции
+    const k = 0.35;
+    S.x = lerp(S.x, target.x, k);
+    S.y = lerp(S.y, target.y, k);
+    S.w = lerp(S.w, target.w, k);
+    S.h = lerp(S.h, target.h, k);
+    S.a = lerp(S.a, target.a, k);
+    S.alpha = lerp(S.alpha, 1, 0.3);
+    statusEl.textContent = '';
+  } else {
+    S.alpha = lerp(S.alpha, 0, 0.25);
+    statusEl.textContent = pts.length === 1 ? 'Нужна вторая рука' : 'Покажите обе руки в кадре';
+  }
+
+  // точки на ладонях
+  pts.forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(W, H) * 0.008, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.fill();
+  });
+
+  if (S.alpha > 0.02) drawEffect();
+}
+
+function rrect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawEffect() {
+  ctx.save();
+  ctx.globalAlpha = S.alpha;
+  ctx.translate(S.x, S.y);
+  ctx.rotate(S.a);
+  const w = S.w, h = S.h;
+
+  if (mode === 0) {
+    const g = ctx.createLinearGradient(-w / 2, -h / 2, w / 2, h / 2);
+    g.addColorStop(0, '#9b5cff');
+    g.addColorStop(1, '#5a14d8');
+    ctx.shadowColor = 'rgba(123,47,255,.75)';
+    ctx.shadowBlur = h * 0.5;
+    ctx.fillStyle = g;
+    rrect(-w / 2, -h / 2, w, h, Math.min(h * 0.22, 28));
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.lineWidth = Math.max(2, h * 0.04);
+    ctx.strokeStyle = 'rgba(255,255,255,.55)';
+    ctx.stroke();
+    // блик
+    ctx.fillStyle = 'rgba(255,255,255,.14)';
+    rrect(-w / 2 + h * 0.08, -h / 2 + h * 0.08, w - h * 0.16, h * 0.32, Math.min(h * 0.14, 16));
+    ctx.fill();
+  } else {
+    // мем-лицо: эмодзи растягивается по ширине между руками
+    const size = Math.min(w, h * 1.9);
+    ctx.font = `${size}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0,0,0,.45)';
+    ctx.shadowBlur = size * 0.12;
+    ctx.fillText('🤪', 0, size * 0.04);
+  }
+  ctx.restore();
+}
+
+document.getElementById('go').onclick = async () => {
+  errEl.textContent = '';
+  const btn = document.getElementById('go');
+  btn.disabled = true; btn.textContent = 'Загрузка…';
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Камера доступна только по HTTPS. Откройте файл через защищённый адрес.');
+    }
+    await startCamera();
+    initHands();
+    document.getElementById('start').style.display = 'none';
+    document.getElementById('ui').style.display = 'flex';
+    loop();
+  } catch (e) {
+    errEl.textContent = e.name === 'NotAllowedError' ? 'Доступ к камере запрещён. Разрешите его в настройках браузера.' : e.message;
+    btn.disabled = false; btn.textContent = 'Попробовать снова';
+  }
+};
+
+document.getElementById('mode').onclick = e => {
+  mode = (mode + 1) % MODES.length;
+  e.target.textContent = 'Эффект: ' + MODES[mode];
+};
+
+document.getElementById('flip').onclick = async () => {
+  facing = facing === 'user' ? 'environment' : 'user';
+  try { await startCamera(); } catch (e) { facing = 'user'; await startCamera(); }
+};
+</script>
+</body>
+</html>
